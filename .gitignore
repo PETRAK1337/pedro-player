@@ -1,0 +1,4 @@
+# built program (published as a release zip) and the WebView2 SDK that build.ps1 downloads
+dist/
+lib/
+*.zip
