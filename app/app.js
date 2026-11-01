@@ -391,6 +391,7 @@
     if (offWidget()) return;
     S.playing = false;
     const n = nextIndex(true);
+    if (n < 0 && recMode()) { const st = S.stash; restoreStash(st.index + 1 < st.queue.length, st.index + 1); return; }
     if (n < 0) { S.pos = S.dur; renderState(); renderProgress(); return; }
     playIndex(n, true);
   }
@@ -413,6 +414,7 @@
     if (!W) return;
     if (onFile()) { Files.stop(); S.playing = false; renderState(); }
     const autoplay = opts.autoplay !== false;
+    S.stash = null;
     S.source = src;
     S.mode = 'list';
     S.history = [];
@@ -1504,8 +1506,32 @@
 
   // the queue gets them too (any SoundCloud playlist, likes, artist): seeded by its tracks
   function queueRecList() {
-    if (!S.source || S.source.kind === 'rec' || !S.queue.some((it) => scPath(it.permalink || it.url))) return null;
-    return { id: 'q:' + (S.source.url || ''), name: S.source.title || '', tracks: S.queue, queue: true };
+    const base = recMode() ? S.stash : S;     // while recommendations play, they still belong to the queue
+    if (!base.source || base.source.kind === 'rec' || !base.queue.some((it) => scPath(it.permalink || it.url))) return null;
+    return { id: 'q:' + (base.source.url || ''), name: base.source.title || '', tracks: base.queue, queue: true };
+  }
+
+  // Listening to recommendations does not touch the queue: it is put aside (S.stash), the
+  // recommendations play as their own list, and the queue comes back when they end, on
+  // "Вернуться", or on a click on one of its tracks. ＋ / right click put a track into the queue.
+  const recMode = () => !!S.stash && !!S.source && S.source.kind === 'rec';
+  function playRecs(p, items, i, title) {
+    if (!(S.source && S.source.kind === 'rec') && S.queue.length) {
+      S.stash = { source: S.source, queue: S.queue, index: S.index, queueSrc: S.queueSrc, allItems: S.allItems, known: S.known };
+    }
+    playItems(items, i, { kind: 'rec', title: title || 'Рекомендации', url: 'rec:' + p.id });
+  }
+  function restoreStash(play, at) {
+    const st = S.stash;
+    if (!st) return;
+    S.stash = null;
+    ++loadSeq;
+    // the widget holds a recommendation now, so the queue plays track by track
+    Object.assign(S, { source: st.source, queue: st.queue, queueSrc: st.queueSrc, allItems: st.allItems, known: st.known, mode: 'single', history: [], pendingSkip: null });
+    const i = clamp(at != null ? at : st.index, 0, Math.max(0, S.queue.length - 1));
+    if (play && S.queue.length) playIndex(i, false, true);
+    else if (S.queue.length) { setCurrent(i, true); S.needLoad = true; if (S.playing && W) W.pause(); renderState(); }
+    renderCounts(); renderListHead(); refreshQueueView();
   }
   function recView() {
     if (S.tab === 'library' && S.libView) { const p = Lib.get(S.libView); return p && !p.files ? p : null; }
@@ -1523,6 +1549,7 @@
   function playItems(items, i, src) {
     if (!items.length) return;
     ++loadSeq;
+    if (src.kind !== 'rec') S.stash = null;   // something else plays: the put-aside queue is let go
     S.source = src;
     S.queueSrc = src.url;
     S.queue = items.map((x) => Object.assign({}, x, { partial: false }));
@@ -1725,7 +1752,7 @@
   }
   function renderCounts() {
     el.tabs.querySelectorAll('button').forEach((b) => {
-      const n = b.dataset.tab === 'queue' ? S.queue.length : b.dataset.tab === 'library' ? Lib.playlists.length + Lib.saved.length : 0;
+      const n = b.dataset.tab === 'queue' ? (recMode() ? S.stash.queue.length : S.queue.length) : b.dataset.tab === 'library' ? Lib.playlists.length + Lib.saved.length : 0;
       const label = { queue: 'Очередь', library: 'Библиотека', profile: 'Профиль' }[b.dataset.tab];
       b.innerHTML = esc(label) + (n ? '<span class="count">' + n + '</span>' : '');
     });
@@ -2022,6 +2049,7 @@
   function openSrcPage(src) {
     if (!src) return;
     if (src.kind === 'track') { playSrcTrack(src); return; }
+    if (recMode() && S.stash.source && S.stash.source.url === src.url) restoreStash(true);
     S.libView = 'src:' + src.url; S.libSrc = src; S.libForm = null;
     const here = S.source && S.source.url === src.url && S.queueSrc === src.url && S.queue.length;
     if (!here) openSource(src, { quiet: true });       // starts it; the library stays on screen
@@ -2052,6 +2080,7 @@
   // a track on its own (from "Недавнее", search or a link): plays now, the queue stays and goes on after it
   function playTrackNow(it) {
     if (!it) return;
+    if (recMode()) restoreStash(false);
     if (!S.queue.length || S.index < 0) {
       const url = it.permalink || it.url;
       playItems([it], 0, { kind: 'track', title: it.title, author: it.artist, thumb: artUrl(it.art, 't300x300'), url, load: url });
@@ -2115,7 +2144,7 @@
       h += '<div class="note">' + (r.fromTop ? 'Плейлист пуст, поэтому подбираю по тому, что ты слушаешь чаще всего. ' : '') +
         (p.queue ? 'Похожее на то, что в очереди. Клик включает трек следующим, ＋ ставит в конец очереди, ✕ убирает навсегда.'
           : '＋ добавляет трек сюда, ✕ убирает его навсегда. Чем больше треков в плейлисте, тем точнее подбор.') + '</div>';
-      h += items.map((it, i) => trackRow(it, i, !!cur && cur.k === it.k, 'data-rec', 'rec')).join('');
+      h += items.map((it, i) => trackRow(it, i, !!cur && sameTrack(cur, it), 'data-rec', 'rec')).join('');
       if (items.some((x) => !x.full)) setTimeout(() => Rec.fill(p, items), 0);
     }
     return h + '</div>';
@@ -2203,6 +2232,7 @@
 
   function queueRowsHTML() {
     const q = queueRecList();
+    if (recMode()) return S.stash.queue.map((it, i) => trackRow(it, i, false, 'data-qs')).join('') + (q ? recHTML(q) : '');
     return S.queue.map((it, i) => trackRow(it, i, i === S.index, 'data-i')).join('') + hiddenNoteHTML() + (q ? recHTML(q) : '');
   }
   function hiddenNoteHTML() {
@@ -2213,7 +2243,11 @@
 
   function renderListHead() {
     let title = '', meta = '', extra = '';
-    if (S.tab === 'queue' && S.queue.length) {
+    if (S.tab === 'queue' && recMode()) {
+      title = S.stash.source ? S.stash.source.title : 'Очередь';
+      meta = 'сейчас играют рекомендации';
+      extra = '<button class="chip-btn dark" data-act="rec-back" title="Вернуться к очереди"><svg><use href="#i-back"/></svg>К очереди</button>';
+    } else if (S.tab === 'queue' && S.queue.length) {
       title = S.source ? S.source.title : '';
       meta = (S.source && KIND[S.source.kind] ? KIND[S.source.kind] + ' · ' : '') + tracksWord(S.queue.length) + totalOf(S.queue);
       if (S.source && S.source.load && S.source.kind !== 'track' && !Lib.isSaved(S.source.url)) {
@@ -2230,14 +2264,16 @@
     const rec = lib && S.source.url === 'rec:' + S.libView;
     const search = S.tab === 'search' && S.search;
     const wave = lib && S.libView.startsWith('wave:') && S.source.url === S.libView;
-    const attr = showsQueue() ? 'data-i' : local ? 'data-pli' : rec ? 'data-rec' : search ? 'data-s' : wave ? 'data-w' : null;
+    const qrec = S.tab === 'queue' && recMode();
+    const attr = qrec ? 'data-rec' : showsQueue() ? 'data-i' : local ? 'data-pli' : rec ? 'data-rec' : search ? 'data-s' : wave ? 'data-w' : null;
     el.list.querySelectorAll('.row.cur').forEach((r) => { if (!r.classList.contains('lib')) r.classList.remove('cur'); });
     if (!attr) return;
     let at = S.index;
     if (local) { const p = Lib.get(S.libView); at = p ? p.tracks.findIndex(isCur) : -1; }
     if (search) at = S.search.items.findIndex(isCur);
     if (wave) at = (Wave.shown[S.libView.slice(5)] || []).findIndex(isCur);
-    if (rec) { const p = Lib.get(S.libView), it = S.queue[S.index]; at = p && it ? Rec.shown(p).findIndex((x) => x.k === it.k) : -1; }
+    if (qrec) { const q = queueRecList(), it = S.queue[S.index]; at = q && it ? Rec.shown(q).findIndex((x) => sameTrack(x, it)) : -1; }
+    if (rec) { const p = Lib.get(S.libView), it = S.queue[S.index]; at = p && it ? Rec.shown(p).findIndex((x) => sameTrack(x, it)) : -1; }
     const row = el.list.querySelector('[' + attr + '="' + at + '"]');
     if (row) { row.classList.add('cur'); if (!stay) { row.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); followUntil = performance.now() + 1500; } }
   }
@@ -2408,6 +2444,14 @@
   }
   function queueInsert(it, next) {
     const copy = Object.assign({}, it, { partial: false });
+    if (recMode()) {
+      const st = S.stash;
+      if (st.queue.some((x) => sameTrack(x, copy))) { toast('Уже есть в очереди'); return; }
+      st.queue.splice(next ? st.index + 1 : st.queue.length, 0, copy);
+      renderCounts(); refreshQueueView();
+      toast(next ? 'Сыграет после возврата к очереди' : 'Добавлено в конец очереди');
+      return;
+    }
     if (!S.queue.length) { playItems([copy], 0, { kind: 'track', title: it.title, url: '' }); return; }
     detachQueue();
     S.queue.splice(next ? S.index + 1 : S.queue.length, 0, copy);
@@ -2886,6 +2930,7 @@
       Lib.save(); renderList(); renderCounts();
       toast('Убрано из библиотеки');
     },
+    'rec-back': () => restoreStash(true),
     'rec-more': () => { const p = recView(); if (p) Rec.more(p); },
     'rec-refresh': () => { const p = recView(); if (p) Rec.run(p, true); },
     'pl-play': () => { const p = Lib.get(S.libView); if (p) openLocal(p, 0); },
@@ -2966,6 +3011,7 @@
   function rowItem(row) {
     if (row.dataset.i != null) return S.queue[+row.dataset.i];
     if (row.dataset.rec != null) { const rp = recView(); return rp ? Rec.shown(rp)[+row.dataset.rec] : null; }
+    if (row.dataset.qs != null) return S.stash ? S.stash.queue[+row.dataset.qs] : null;
     if (row.dataset.s != null) return S.search ? S.search.items[+row.dataset.s] : null;
     if (row.dataset.w != null) { const k = (S.libView || '').slice(5); return (Wave.shown[k] || [])[+row.dataset.w] || null; }
     if (row.dataset.lib != null) { const src = S.library[+row.dataset.lib]; return src && src.kind === 'track' ? srcTrack(src) : null; }
@@ -3024,15 +3070,13 @@
     }
     const row = e.target.closest('.row');
     if (!row) return;
-    if (row.dataset.rec != null) {
+    if (row.dataset.qs != null) {
+      restoreStash(true, +row.dataset.qs);   // back to the queue, at that track
+    } else if (row.dataset.rec != null) {
       const p = recView(), items = p ? Rec.shown(p) : [], it = items[+row.dataset.rec], cur = S.queue[S.index];
       if (!it) return;
-      if (p.queue) {
-        // straight after the current track, and on
-        queueInsert(it, true);
-        playIndex(S.index + 1);
-      } else if (S.source && S.source.url === 'rec:' + p.id && cur && cur.k === it.k) togglePlay();
-      else playItems(items, +row.dataset.rec, { kind: 'rec', title: 'Рекомендации · ' + p.name, url: 'rec:' + p.id });
+      if (S.source && S.source.url === 'rec:' + p.id && cur && sameTrack(cur, it)) togglePlay();
+      else playRecs(p, items, +row.dataset.rec, p.queue ? 'Рекомендации' : 'Рекомендации · ' + p.name);
     } else if (row.dataset.pli != null) {
       const p = Lib.get(S.libView), i = +row.dataset.pli;
       if (S.source && S.source.url === 'local:' + p.id && isCur(p.tracks[i])) togglePlay(); else openLocal(p, i);
