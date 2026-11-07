@@ -597,6 +597,7 @@
     const file = isFile(S.queue[i]);
     if (!file && !W) return;
     if (!fromHistory && S.index >= 0 && i !== S.index) S.history = S.history.concat(S.index).slice(-50);
+    if (S.source && S.source.kind === 'rec' && i !== S.index) Rec.leave(S.source.url.slice(4), S.queue[S.index], Stats.cur ? Stats.cur.ms : 0);
     setCurrent(i, true);
     S.pendingSkip = null;
     S.needLoad = false;
@@ -1152,6 +1153,8 @@
   //  5. variety: 2 tracks per artist per page. ✕ hides a track for good, an artist hidden twice
   //     sinks, and tracks shown but never taken slowly give way to new ones.
   const SC_ORIGIN = 'https://soundcloud.com';
+  // not songs: beats for sale, talk, snippets, hour-long sets
+  const JUNK = /type\s*beat|\bfree\b.{0,24}\bbeat|\bbeats?\b.{0,24}\bfree\b|\b(podcast|episode|interview|asmr|tutorial|ringtone|teaser|snippet|full album|dj set|live set|radio show|mixtape)\b/i;
   const NOT_TRACK = /^\/[^/]+\/(sets|likes|tracks|reposts|albums|popular-tracks|followers|following|comments)$/i;
   function scPath(u) {
     const m = /^(?:https?:\/\/(?:www\.|m\.)?soundcloud\.com)?(\/[^/?#\s"]+\/[^/?#\s"]+)\/?(?:[?#]|$)/i.exec(u || '');
@@ -1160,14 +1163,23 @@
   const pathKey = (p) => (p || '').toLowerCase();
   const songKey = (a, t) => (String(a) + '|' + String(t)).toLowerCase().replace(/\(.*?\)|\[.*?\]|\bfeat\..*$|[^\p{L}\p{N}|]+/gu, '');
   // the song behind an upload: "Artist - Song (sped up + reverb)" and "song slowed" are one song
-  const VERSION = /\b(sped|speed|slowed|slow|reverb|nightcore|bass\s*boost(ed)?|boosted|tik\s*tok|version|remix|edit|cover|8d|phonk|ultra|super|perfect|[\d.]+x|x[\d.]+|by\s+\S+|up|down|and|feat\.?|ft\.?|speedup|spedup|glitchy|glitch|loop(ed)?|bb|\d{4}|#\S+)\b/g;
+  const VERSION = /\b(sped|speed|slowed|slow|reverb|nightcore|bass\s*boost(ed)?|boosted|tik\s*tok|version|remix|edit|cover|8d|phonk|ultra|super|perfect|[\d.]+x|x[\d.]+|by\s+\S+|up|down|and|feat\.?|ft\.?|speedup|spedup|glitchy|glitch|loop(ed)?|bb|\d{4}|#\S+|bass|boost|distorted|daycore|instrumental|reverbed|best|part|extended|edited|hardstyle|tekk)\b/g;
+  const BY = /\s(by|prod\.?)\s.*$/;   // "… by someone" ends the song's name
   function songCore(t) {
     const parts = String(t || '').toLowerCase().split(/\s[-–—|]\s/);
-    const core = (parts[parts.length - 1] || '').replace(/[([{].*?[)\]}]|[([{].*$/g, ' ').replace(VERSION, ' ').replace(/[^\p{L}\p{N}]+/gu, '');
+    const core = (parts[parts.length - 1] || '').replace(BY, '').replace(/[([{].*?[)\]}]|[([{].*$/g, ' ').replace(VERSION, ' ').replace(/[^\p{L}\p{N}]+/gu, '');
     return core.length >= 3 ? core : String(t || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
   }
   // the same words in any order: "Рассвет-Конец солнечных дней" = "конец солнечных дней - рассвет"
-  const songWords = (t) => [...new Set(String(t || '').toLowerCase().replace(/[([{].*?[)\]}]/g, ' ').replace(VERSION, ' ').split(/[^\p{L}\p{N}]+/u).filter((w) => w.length > 1))].sort().join(' ');
+  const songWords = (t) => [...new Set(String(t || '').toLowerCase().replace(BY, '').replace(/[([{].*?[)\]}]/g, ' ').replace(VERSION, ' ').split(/[^\p{L}\p{N}]+/u).filter((w) => w.length > 1))].sort().join(' ');
+  // every name the song may go by: "Song - Artist" and "Artist - Song" both count (an artist
+  // matching another track's artist only drops a candidate, and there are plenty)
+  function songKeys(t) {
+    const parts = String(t || '').split(/\s[-–—|]\s/), keys = new Set([songCore(t), songWords(t)]);
+    if (parts.length > 1) { const first = songCore(parts[0]); if (first.length >= 3) keys.add(first); }
+    keys.delete('');
+    return [...keys];
+  }
   const shortTitle = (t) => { const x = String(t || '').replace(/\s*[([{].*?[)\]}]/g, '').split(/\s[-–—]\s/).pop().trim() || String(t || ''); return x.length > 34 ? x.slice(0, 32) + '…' : x; };
 
   async function pool(list, n, fn) {
@@ -1180,20 +1192,21 @@
     cache: store.get('recCache', {}),      // track path → {t, m: meta, n: [similar], s: [playlists]} or playlist path → {t, n: [tracks]}
     no: new Set(store.get('recNo', [])),   // tracks hidden with ✕
     noArtist: store.get('recNoArtist', {}),// artist → times hidden
-    seen: store.get('recSeen', {}),        // track → times shown without being taken
-    lists: {},                             // playlist id → {state, pool, page, why, at}
+    skip: new Set(store.get('recSkip', [])), // recommendations skipped within 25 s
+    noTags: store.get('recNoTags', {}),    // tag → times on a track hidden with ✕
+    sess: {},                              // list id → the growing search (see next)
+    lists: {},                             // list id → {state, items} on screen
     dirty: false,
 
     save() {
       if (!this.dirty) return;
       const keys = Object.keys(this.cache);
-      if (keys.length > 600) keys.sort((a, b) => this.cache[a].t - this.cache[b].t).slice(0, keys.length - 600).forEach((k) => delete this.cache[k]);
-      const seen = Object.keys(this.seen);
-      if (seen.length > 3000) seen.slice(0, seen.length - 3000).forEach((k) => delete this.seen[k]);
+      if (keys.length > 1500) keys.sort((a, b) => this.cache[a].t - this.cache[b].t).slice(0, keys.length - 1500).forEach((k) => delete this.cache[k]);
       store.set('recCache', this.cache);
       store.set('recNo', [...this.no].slice(-3000));
+      store.set('recSkip', [...this.skip].slice(-3000));
       store.set('recNoArtist', this.noArtist);
-      store.set('recSeen', this.seen);
+      store.set('recNoTags', this.noTags);
       this.dirty = false;
     },
 
@@ -1269,165 +1282,175 @@
       return out;
     },
 
-    seeds(p, plays) {
-      const n = p.tracks.length;
+    // ── one growing search per list ──
+    // Every "Другие" shows tracks this list never showed before. The search widens step by step:
+    // more of the playlist's tracks as starting points, people's playlists around them, then the
+    // neighbours of the best finds. Nothing reaches the screen unchecked: each track's own page
+    // is read first (length, plays, tags, previews, title).
+    session(p) {
+      return this.sess[p.id] || (this.sess[p.id] = { used: new Set(), setsUsed: 0, C: new Map(), metas: [], liked: [], cores: new Set() });
+    },
+    shownOf(id) {
+      const all = this.shown_ || (this.shown_ = store.get('recShown', {}));
+      return all[id] || (all[id] = {});
+    },
+    // the playlist's tracks as starting points, strongest first: recently added, played often,
+    // and recommendations you listened to the end; ones already used come last
+    seedList(p, plays, ses) {
       let list = p.tracks.map((it, i) => ({ it, path: scPath(it.permalink || it.url), i })).filter((x) => x.path);
       let fromTop = false;
       if (!list.length) {
-        // empty playlist: what you listen to most
         fromTop = true;
-        list = Object.keys(plays).filter((k) => plays[k] > 0).sort((a, b) => plays[b] - plays[a]).slice(0, 16).map((k, i) => {
+        list = Object.keys(plays).filter((k) => plays[k] > 0).sort((a, b) => plays[b] - plays[a]).slice(0, 30).map((k, i) => {
           const meta = Object.keys(Stats.data.meta).map((m) => Stats.data.meta[m]).find((m) => pathKey(scPath(m.u)) === k) || {};
-          return { it: { title: meta.t || k, artist: meta.a || '' }, path: scPath(meta.u) || k, i: 16 - i };
+          return { it: { title: meta.t || k, artist: meta.a || '' }, path: scPath(meta.u) || k, i: 30 - i };
         });
       }
-      list.forEach((x) => { x.w = 1 + (fromTop ? 0.4 : 0.8 * x.i / Math.max(1, n - 1)) + 0.45 * Math.log1p(plays[pathKey(x.path)] || 0); });
-      // jitter: each refresh looks from slightly different seeds
-      const ranked = list.map((x) => ({ x, r: x.w * (0.75 + Math.random() * 0.5) })).sort((a, b) => b.r - a.r).map((y) => y.x);
-      const perArtist = {}, out = [];
-      for (const x of ranked) {
-        const a = (x.it.artist || '').toLowerCase();
-        if ((perArtist[a] || 0) >= 2) continue;
-        perArtist[a] = (perArtist[a] || 0) + 1;
-        out.push(x);
-        if (out.length >= 12) break;
-      }
-      for (const x of ranked) { if (out.length >= Math.min(12, ranked.length)) break; if (!out.includes(x)) out.push(x); }
-      return { seeds: out, fromTop };
+      const n = Math.max(1, list.length - 1);
+      list.forEach((x) => { x.w = 1 + (fromTop ? 0.4 : 0.7 * x.i / n) + 0.45 * Math.log1p(plays[pathKey(x.path)] || 0); });
+      ses.liked.forEach((l) => { if (!list.some((x) => pathKey(x.path) === pathKey(l.path))) list.push({ it: { title: l.title, artist: l.artist }, path: l.path, w: 1.6, liked: true }); });
+      return { list: list.sort((a, b) => b.w - a.w), fromTop };
     },
-
-    async build(p) {
-      const plays = this.plays();
-      const { seeds, fromTop } = this.seeds(p, plays);
-      if (!seeds.length) return { pool: [], fromTop, none: true };
+    filters(p) {
       const inList = new Set(p.tracks.map((it) => pathKey(scPath(it.permalink || it.url))).filter(Boolean));
       const inSongs = new Set(p.tracks.map((it) => songKey(it.artist, it.title)));
-      const inCores = new Set(p.tracks.map((it) => songCore(it.title)).concat(p.tracks.map((it) => songWords(it.title))));
-      seeds.forEach((s) => inList.add(pathKey(s.path)));
-
-      // 1. seeds: their similar tracks and their metadata (the playlist's sound)
-      await pool(seeds, 4, async (s) => { s.page = await this.track(s.path); });
-      const prof = {}, durs = [];
-      let profW = 0;
-      seeds.forEach((s) => {
-        const m = s.page && s.page.m;
-        if (!m) return;
-        m.tags.forEach((t) => { prof[t] = (prof[t] || 0) + s.w; });
-        profW += s.w;
-        if (m.d) durs.push(m.d);
-      });
-      for (const t in prof) prof[t] /= profW || 1;
-      durs.sort((a, b) => a - b);
-      const medDur = durs.length ? durs[durs.length >> 1] : 0;
-
-      const C = new Map();
-      const cand = (y) => {
-        const k = pathKey(y.path);
-        if (inList.has(k) || this.no.has(k) || inSongs.has(songKey(y.artist, y.title)) || inCores.has(songCore(y.title)) || inCores.has(songWords(y.title))) return null;
-        let c = C.get(k);
-        if (!c) C.set(k, (c = { k, path: scPath(y.path), title: y.title, artist: y.artist, s: 0, from: new Map(), co: new Set(), mutual: 0, near: 0 }));
-        return c;
+      const inCores = new Set(p.tracks.flatMap((it) => songKeys(it.title)));
+      return {
+        inList,
+        out: (y) => {
+          const k = pathKey(y.path);
+          return inList.has(k) || this.no.has(k) || this.skip.has(k) || inSongs.has(songKey(y.artist, y.title)) || songKeys(y.title).some((x) => inCores.has(x));
+        },
       };
-      seeds.forEach((s) => (s.page ? s.page.n : []).forEach((y, r) => {
-        const c = cand(y);
-        if (!c) return;
-        const v = s.w / (1 + 0.2 * r);
-        c.s += v;
-        c.from.set(s, Math.max(c.from.get(s) || 0, v));
-      }));
-
-      // 2. people's playlists around the three strongest seeds
-      const top3 = seeds.slice().sort((a, b) => b.w - a.w).slice(0, 3);
-      await pool(top3, 3, async (s) => {
-        (await this.playlistsWith(s.path)).forEach((y) => {
-          const c = cand(y);
-          if (!c || c.co.has(s)) return;
-          c.co.add(s);
-          c.s += 0.4 * s.w;
+    },
+    addCand(ses, f, y, v, via) {
+      if (!scPath(y.path) || f.out(y)) return;
+      const k = pathKey(y.path);
+      let c = ses.C.get(k);
+      if (!c) ses.C.set(k, (c = { k, path: scPath(y.path), title: y.title, artist: y.artist, s: 0, from: new Map(), co: new Set(), hop: null }));
+      if (via.co) { if (c.co.has(via.seed)) return; c.co.add(via.seed); c.s += v; return; }
+      if (via.hop) { if (!c.hop) { c.hop = via.hop; c.s += v; } return; }
+      const was = c.from.get(via.seed) || 0;
+      if (v > was) { c.s += v - was; c.from.set(via.seed, v); }
+    },
+    // the sound of the list: tags, typical length and plays of its tracks
+    profile(ses) {
+      const prof = {}, durs = [], plays = [];
+      let w = 0;
+      ses.metas.forEach(({ m, w: sw }) => {
+        m.tags.forEach((t) => { prof[t] = (prof[t] || 0) + sw; });
+        w += sw;
+        if (m.d) durs.push(m.d);
+        if (m.p) plays.push(m.p);
+      });
+      for (const t in prof) prof[t] /= w || 1;
+      const med = (a) => (a.length ? a.sort((x, y) => x - y)[a.length >> 1] : 0);
+      return { prof, w, medDur: med(durs), medPlays: med(plays) };
+    },
+    noTagScore(tags) {
+      let n = 0;
+      tags.forEach((t) => { n += Math.min(this.noTags[t] || 0, 3); });
+      return n;
+    },
+    // a candidate's own page decides: dropped for good, or scored
+    judge(c, pr, inList) {
+      const m = c.page && c.page.m;
+      c.vetted = true;
+      if (!m || m.snip) return (c.ok = false);
+      const t = (m.t || c.title || '').toLowerCase();
+      if (JUNK.test(t)) return (c.ok = false);
+      const shortList = pr.medDur && pr.medDur < 100000;
+      if (m.d && m.d < (shortList ? 40000 : 75000)) return (c.ok = false);                 // loops, snippets
+      if (pr.medDur && pr.medDur < 8 * 60000 && m.d > 12 * 60000) return (c.ok = false);   // a long mix among songs
+      const floor = Math.max(300, (pr.medPlays || 0) * 0.015);
+      if (m.p < floor) return (c.ok = false);                                             // a re-upload nobody plays
+      let f = 1, mutual = 0;
+      c.page.n.forEach((y) => { if (inList.has(pathKey(y.path))) mutual++; });
+      c.mutual = mutual;
+      f *= 1 + 0.4 * Math.min(mutual, 4);
+      if (c.from.size + c.co.size <= 1 && !mutual) f *= c.hop ? 0.75 : 0.6;
+      if (m.tags.length && pr.w) {
+        const sim = m.tags.reduce((a, x) => a + (pr.prof[x] || 0), 0) / Math.sqrt(m.tags.length);
+        f *= sim < 0.05 ? 0.45 : 0.75 + 0.5 * Math.min(sim, 1.2);
+      } else f *= 0.85;
+      if (pr.medDur && m.d) { const lr = Math.log(m.d / pr.medDur); f *= 0.5 + 0.5 * Math.exp(-(lr * lr) / 0.5); }
+      f *= 1 + 0.12 * Math.min(4, Math.max(0, Math.log10(m.p / floor)));                  // heard by more people
+      if (m.p > 2000 && m.l / m.p > 0.03) f *= 1.15;                                       // and liked by them
+      f *= Math.pow(0.5, this.noArtist[(m.a || c.artist || '').toLowerCase()] || 0);
+      f *= Math.pow(0.8, this.noTagScore(m.tags));
+      c.title = m.t || c.title; c.artist = m.a || c.artist;
+      c.f = f;
+      return (c.ok = true);
+    },
+    raw: (c) => c.s * (1 + 0.6 * (c.from.size + c.co.size - 1)),
+    // the next `want` tracks this list has never shown
+    async next(p, want, keep) {
+      const plays = this.plays(), ses = this.session(p), f = this.filters(p), shown = this.shownOf(p.id);
+      const { list: seeds, fromTop } = this.seedList(p, plays, ses);
+      if (!seeds.length) return { items: [], fromTop, none: true };
+      const free = (c) => !shown[c.k] && !this.no.has(c.k) && !this.skip.has(c.k) && !f.inList.has(c.k);
+      for (let round = 0; round < 4; round++) {
+        // a) starting points not used yet: 10 the first time, then 6 more each step
+        const fresh = seeds.filter((s) => !ses.used.has(pathKey(s.path))).slice(0, ses.used.size ? 6 : 10);
+        fresh.forEach((s) => ses.used.add(pathKey(s.path)));
+        await pool(fresh, 4, async (s) => {
+          const pg = await this.track(s.path);
+          if (pg.m) ses.metas.push({ m: pg.m, w: s.w });
+          pg.n.forEach((y, r) => this.addCand(ses, f, y, s.w / (1 + 0.25 * r), { seed: s }));
         });
-      });
-
-      // 3. agreement between seeds
-      C.forEach((c) => { c.s *= 1 + 0.55 * (c.from.size + c.co.size - 1); });
-
-      // 4. a closer look at the best 30
-      const short = [...C.values()].sort((a, b) => b.s - a.s).slice(0, 30);
-      const shortKeys = new Set(short.map((c) => c.k));
-      await pool(short, 4, async (c) => { c.page = await this.track(c.path); });
-      const out = [];
-      short.forEach((c) => {
-        const m = c.page && c.page.m;
-        let f = 1;
-        if (m) {
-          if (m.snip) return;                                          // 30-second preview only
-          if (medDur && medDur < 10 * 60000 && m.d > 20 * 60000) return; // a long mix among songs
-          c.page.n.forEach((y) => {
-            const k = pathKey(y.path);
-            if (inList.has(k)) c.mutual++;
-            else if (shortKeys.has(k)) c.near++;
-          });
-          f *= 1 + 0.35 * Math.min(c.mutual, 4) + 0.08 * Math.min(c.near, 5);
-          if (m.tags.length && profW) {
-            const sim = Math.min(1.4, m.tags.reduce((a, t) => a + (prof[t] || 0), 0) / Math.sqrt(m.tags.length));
-            f *= 0.7 + 0.45 * sim;
-          } else f *= 0.92;
-          if (medDur && m.d) { const lr = Math.log(m.d / medDur); f *= 0.55 + 0.45 * Math.exp(-(lr * lr) / 0.72); }
-          f /= 1 + 0.07 * Math.max(0, Math.log10(m.p + 1) - 5);          // megahits: a small discount
-          if (m.p > 500 && m.p < 300000 && m.l / m.p > 0.025) f *= 1.1;   // loved by the few who found it
-          c.title = m.t || c.title; c.artist = m.a || c.artist;
-        } else f *= 0.8;
-        const heard = plays[c.k] || 0;
-        if (heard >= 3) f *= 0.45; else if (heard) f *= 0.8;
-        f *= Math.pow(0.5, this.noArtist[(c.artist || '').toLowerCase()] || 0);
-        f *= Math.pow(0.8, Math.min(this.seen[c.k] || 0, 4));
-        c.score = c.s * f;
-        out.push(c);
-      });
-      // one step further: the strongest picks' own neighbours fill up a small playlist's list
-      // (already downloaded, no extra requests)
-      if (out.length < 40) {
-        out.slice().sort((a, b) => b.score - a.score).slice(0, 10).forEach((c) => (c.page ? c.page.n : []).forEach((y, r) => {
-          if (C.has(pathKey(y.path))) return;
-          const d = cand(y);
-          if (!d) return;
-          d.from.set({ it: { title: c.title }, hop: true }, 1);
-          d.score = c.score * 0.3 / (1 + 0.2 * r) * Math.pow(0.8, Math.min(this.seen[d.k] || 0, 4)) *
-            Math.pow(0.5, this.noArtist[(d.artist || '').toLowerCase()] || 0) * ((plays[d.k] || 0) >= 3 ? 0.45 : 1);
-          out.push(d);
-        }));
+        // b) people's playlists around two more starting points
+        const setSeeds = seeds.slice(ses.setsUsed, ses.setsUsed + 2);
+        ses.setsUsed += setSeeds.length;
+        await pool(setSeeds, 2, async (s) => { (await this.playlistsWith(s.path)).forEach((y) => this.addCand(ses, f, y, 0.35 * s.w, { co: true, seed: s })); });
+        // c) read the pages of the strongest unread candidates
+        const pr = this.profile(ses);
+        const todo = [...ses.C.values()].filter((c) => !c.vetted && free(c)).sort((a, b) => this.raw(b) - this.raw(a)).slice(0, 18);
+        await pool(todo, 5, async (c) => { c.page = await this.track(c.path); });
+        todo.forEach((c) => this.judge(c, pr, f.inList));
+        const good = [...ses.C.values()].filter((c) => c.ok && free(c));
+        if (good.length >= want * 1.5) break;
+        // d) still short: the best finds' own neighbours join (they are read before showing too)
+        const from = [...ses.C.values()].filter((c) => c.ok && !c.hopped).sort((a, b) => this.raw(b) * b.f - this.raw(a) * a.f).slice(0, 5);
+        from.forEach((c) => { c.hopped = true; c.page.n.forEach((y, r) => this.addCand(ses, f, y, 0.4 * this.raw(c) * c.f / (1 + 0.25 * r), { hop: c })); });
+        if (!fresh.length && !setSeeds.length && !from.length) break;
       }
-      out.sort((a, b) => b.score - a.score);
       this.save();
-      // one upload per song: the best-ranked version stays, other speed-ups and re-uploads go
-      const cores = new Set();
-      for (let i = 0; i < out.length; i++) {
-        const core = songCore(out[i].title), words = songWords(out[i].title);
-        if (inCores.has(core) || cores.has(core) || (words && (inCores.has(words) || cores.has(words)))) out.splice(i--, 1);
-        else { cores.add(core); if (words) cores.add(words); }
+      // the best of the rest, varied: two per artist, one upload per song
+      const ranked = [...ses.C.values()].filter((c) => c.ok && free(c)).sort((a, b) => this.raw(b) * b.f - this.raw(a) * a.f);
+      const per = {}, cores = new Set(keep ? [] : ses.cores), picks = [];
+      for (const c of ranked) {
+        if (picks.length >= want) break;
+        const a = (c.artist || '').toLowerCase(), keys = songKeys(c.title);
+        if ((per[a] || 0) >= 2 || keys.some((x) => cores.has(x))) continue;
+        per[a] = (per[a] || 0) + 1;
+        keys.forEach((x) => cores.add(x));
+        picks.push(c);
       }
-
-      // 5. variety: pages of 8 with at most 2 tracks of an artist each
-      const pageSize = 8, list = [], left = out.slice();
-      while (left.length) {
-        const page = [], per = {};
-        for (let i = 0; i < left.length && page.length < pageSize; ) {
-          const a = (left[i].artist || '').toLowerCase();
-          if ((per[a] || 0) >= 2) { i++; continue; }
-          per[a] = (per[a] || 0) + 1;
-          page.push(left.splice(i, 1)[0]);
-        }
-        if (!page.length) page.push(...left.splice(0, pageSize));
-        list.push(...page);
+      if (!keep) picks.forEach((c) => songKeys(c.title).forEach((x) => ses.cores.add(x)));
+      if (!keep) {
+        const now = Date.now();
+        picks.forEach((c) => { shown[c.k] = now; });
+        this.saveShown();
       }
-      return { pool: list.map((c) => this.item(c)), fromTop };
+      return { items: picks.map((c) => this.item(c)), fromTop };
+    },
+    saveShown() {
+      const all = this.shown_ || {}, cut = Date.now() - 30 * 864e5;
+      for (const id in all) for (const k in all[id]) if (all[id][k] < cut) delete all[id][k];
+      store.set('recShown', all);
+    },
+    // a single mix (Моя волна): one wide pass, nothing marked as shown
+    async build(p) {
+      const x = await this.next(p, 40, true);
+      return { pool: x.items, fromTop: x.fromTop, none: x.none };
     },
 
     item(c) {
       const m = (c.page && c.page.m) || {};
       const from = [...c.from.entries()].sort((a, b) => b[1] - a[1]), why = from.map((e) => shortTitle(e[0].it.title));
-      let reason = why.length
-        ? (from[0][0].hop ? 'рядом с «' : 'как «') + why[0] + '»' + (why.length > 1 ? ' и ещё ' + (why.length - 1) : '')
-        : 'в плейлистах с «' + shortTitle([...c.co][0].it.title) + '»';
+      let reason = why.length ? 'как «' + why[0] + '»' + (why.length > 1 ? ' и ещё ' + (why.length - 1) : '')
+        : c.co.size ? 'в плейлистах с «' + shortTitle([...c.co][0].it.title) + '»'
+        : 'рядом с «' + shortTitle(c.hop.title) + '»';
       if (c.mutual >= 2) reason += ' · взаимно';
       return {
         id: m.id || 'sc:' + c.k, title: c.title, artist: c.artist, art: m.art || '', dur: m.d || 0,
@@ -1435,71 +1458,78 @@
       };
     },
 
-    // the list for a playlist page: built once, refreshed on demand
+    // the list on screen: 8 tracks; "Другие" brings 8 new ones
     get(p) {
       let r = this.lists[p.id];
-      if (!r) r = this.lists[p.id] = { state: 'idle', pool: [], page: 0 };
-      if (r.state === 'idle' || (r.state === 'ready' && Date.now() - r.at > 30 * 60000)) {
-        r.state = 'queued';
-        setTimeout(() => this.run(p), 0);
-      }
+      if (!r) r = this.lists[p.id] = { state: 'idle', items: [] };
+      if (r.state === 'idle') { r.state = 'queued'; setTimeout(() => this.run(p), 0); }
       return r;
     },
     shown(p) {
       const r = this.lists[p.id];
-      if (!r || !r.pool.length) return [];
+      if (!r || !r.items.length) return [];
       const have = new Set(p.tracks.map((it) => pathKey(scPath(it.permalink || it.url))));
-      r.pool = r.pool.filter((x) => !have.has(x.k) && !this.no.has(x.k));
-      const pages = Math.max(1, Math.ceil(r.pool.length / 8));
-      r.page %= pages;
-      return r.pool.slice(r.page * 8, r.page * 8 + 8);
+      r.items = r.items.filter((x) => !have.has(x.k) && !this.no.has(x.k));
+      return r.items;
     },
-    async run(p, again) {
-      const r = this.lists[p.id] || (this.lists[p.id] = { pool: [], page: 0 });
+    async run(p) {
+      const r = this.lists[p.id] || (this.lists[p.id] = { items: [] });
       if (r.state === 'loading') return;
-      if (again) this.shown(p).forEach((x) => { this.seen[x.k] = (this.seen[x.k] || 0) + 1; this.dirty = true; });
       r.state = 'loading';
       redrawRec(p);
       try {
-        const x = await this.build(p);
-        Object.assign(r, { state: x.none ? 'none' : x.pool.length ? 'ready' : 'empty', pool: x.pool, page: 0, fromTop: x.fromTop, at: Date.now() });
+        const x = await this.next(p, 8);
+        if (x.items.length) r.items = x.items;
+        Object.assign(r, { state: x.none ? 'none' : x.items.length ? 'ready' : 'empty', fromTop: x.fromTop });
       } catch (e) {
         r.state = 'error';
       }
       redrawRec(p);
     },
+    // a track taken or hidden leaves a gap: one new track fills it, quietly
+    async topUp(p) {
+      const r = this.lists[p.id];
+      if (!r || r.state === 'loading' || this.shown(p).length >= 8) return;
+      try {
+        const x = await this.next(p, 8 - this.shown(p).length);
+        r.items = this.shown(p).concat(x.items);
+        redrawRec(p);
+      } catch (e) { /* the gap stays */ }
+    },
     async fill(p, items) {
       const todo = items.filter((x) => !x.full && !x.filling);
       if (!todo.length) return;
       todo.forEach((x) => { x.filling = true; });
-      let drop = false;
       await pool(todo, 4, async (x) => {
         const m = (await this.track(x.path)).m;
         x.full = true;
-        if (!m) return;
-        if (m.snip) { x.snip = true; drop = true; return; }
-        Object.assign(x, { id: m.id || x.id, title: m.t || x.title, artist: m.a || x.artist, art: m.art || '', dur: m.d || 0 });
+        if (m) Object.assign(x, { id: m.id || x.id, title: m.t || x.title, artist: m.a || x.artist, art: m.art || '', dur: m.d || 0 });
       });
-      const r = this.lists[p.id];
-      if (drop && r) r.pool = r.pool.filter((x) => !x.snip);
       this.save();
       redrawRec(p);
     },
-    more(p) {
-      const r = this.lists[p.id];
-      if (!r) return;
-      this.shown(p).forEach((x) => { this.seen[x.k] = (this.seen[x.k] || 0) + 1; });
-      this.dirty = true; this.save();
-      r.page++;
-      if (r.page * 8 >= r.pool.length) { this.run(p); return; }  // pool used up: look again
-      redrawRec(p);
-    },
+    // ✕: the track never comes back; its artist and tags sink a little
     hide(p, k) {
-      const r = this.lists[p.id], it = r && r.pool.find((x) => x.k === k);
+      const r = this.lists[p.id], it = r && r.items.find((x) => x.k === k);
       this.no.add(k);
       if (it && it.artist) { const a = it.artist.toLowerCase(); this.noArtist[a] = (this.noArtist[a] || 0) + 1; }
+      const m = this.cache[k] && this.cache[k].m;
+      if (m) m.tags.forEach((t) => { this.noTags[t] = (this.noTags[t] || 0) + 1; });
       this.dirty = true; this.save();
       redrawRec(p);
+      this.topUp(p);
+    },
+    // leaving a recommendation that played: under 25 s it was not it (never again);
+    // listened through, it becomes a starting point for that list's next picks
+    leave(listId, it, ms) {
+      const path = it && scPath(it.permalink || it.url);
+      if (!path) return;
+      const k = pathKey(path);
+      if (ms < 25000) { this.skip.add(k); this.dirty = true; this.save(); return; }
+      if (ms >= 60000 || (it.dur && ms >= it.dur * 0.7)) {
+        const ses = this.sess[listId];
+        if (ses && !ses.liked.some((x) => pathKey(x.path) === k)) ses.liked.push({ path, title: it.title, artist: it.artist });
+      }
     },
   };
   addEventListener('pagehide', () => Rec.save());
@@ -1524,6 +1554,7 @@
   function restoreStash(play, at) {
     const st = S.stash;
     if (!st) return;
+    if (S.source && S.source.kind === 'rec') Rec.leave(S.source.url.slice(4), S.queue[S.index], Stats.cur ? Stats.cur.ms : 0);
     S.stash = null;
     ++loadSeq;
     // the widget holds a recommendation now, so the queue plays track by track
@@ -2132,18 +2163,17 @@
     const r = Rec.get(p), items = Rec.shown(p), busy = r.state === 'loading' || r.state === 'queued';
     const cur = S.source && S.source.url === 'rec:' + p.id ? S.queue[S.index] : null;
     let h = '<div class="rec' + (busy ? ' busy' : '') + (p.queue ? ' in-queue' : '') + '"><div class="sec-head"><span>Рекомендации</span><span class="sec-actions">' +
-      (items.length && !busy ? '<button class="chip-btn" data-act="rec-more" title="Следующие треки"><svg><use href="#i-next"/></svg>Ещё</button>' : '') +
-      '<button class="chip-btn" data-act="rec-refresh" title="Подобрать заново"' + (busy ? ' disabled' : '') + '><svg><use href="#i-repeat"/></svg>' + (busy ? 'Подбираю…' : 'Обновить') + '</button></span></div>';
+      '<button class="chip-btn" data-act="rec-refresh" title="8 треков, которых здесь ещё не было"' + (busy ? ' disabled' : '') + '><svg><use href="#i-repeat"/></svg>' + (busy ? 'Подбираю…' : 'Другие') + '</button></span></div>';
     if (busy && !items.length) {
       h += '<div class="note">Слушаю плейлист и ищу похожее на SoundCloud…</div>' + [0, 1, 2].map((i) => trackRow({ partial: true }, i, false, 'data-skel')).join('');
     } else if (r.state === 'none') {
       h += '<div class="note">Добавь пару треков с SoundCloud, и здесь появится похожая музыка.</div>';
     } else if (!items.length) {
-      h += '<div class="note">' + (r.state === 'error' ? 'SoundCloud не ответил.' : 'Ничего нового не нашлось.') + ' Нажми «Обновить».</div>';
+      h += '<div class="note">' + (r.state === 'error' ? 'SoundCloud не ответил. Нажми «Другие».' : 'Новых похожих треков пока нет: всё подходящее уже было. Добавь в плейлист пару треков, и подбор расширится.') + '</div>';
     } else {
       h += '<div class="note">' + (r.fromTop ? 'Плейлист пуст, поэтому подбираю по тому, что ты слушаешь чаще всего. ' : '') +
-        (p.queue ? 'Похожее на то, что в очереди. Клик включает трек следующим, ＋ ставит в конец очереди, ✕ убирает навсегда.'
-          : '＋ добавляет трек сюда, ✕ убирает его навсегда. Чем больше треков в плейлисте, тем точнее подбор.') + '</div>';
+        (p.queue ? 'Клик включает рекомендации, очередь ждёт. ＋ ставит трек в очередь, ✕ убирает навсегда.'
+          : 'Клик включает, ＋ добавляет сюда, ✕ убирает навсегда.') + ' Пропущенное за 25 секунд больше не попадётся, дослушанное подскажет, что искать дальше.</div>';
       h += items.map((it, i) => trackRow(it, i, !!cur && sameTrack(cur, it), 'data-rec', 'rec')).join('');
       if (items.some((x) => !x.full)) setTimeout(() => Rec.fill(p, items), 0);
     }
@@ -2931,8 +2961,7 @@
       toast('Убрано из библиотеки');
     },
     'rec-back': () => restoreStash(true),
-    'rec-more': () => { const p = recView(); if (p) Rec.more(p); },
-    'rec-refresh': () => { const p = recView(); if (p) Rec.run(p, true); },
+    'rec-refresh': () => { const p = recView(); if (p) Rec.run(p); },
     'pl-play': () => { const p = Lib.get(S.libView); if (p) openLocal(p, 0); },
     'pl-shuffle': () => {
       const p = Lib.get(S.libView);
@@ -3031,6 +3060,7 @@
       if (!p || !it) return;
       if (recNo) { Rec.hide(p, it.k); return; }
       if (p.queue) { queueInsert(it, false); return; }
+      setTimeout(() => Rec.topUp(p), 0);
       const res = Lib.add(p, it);
       toast(res === 'ok' ? 'Добавлено в «' + p.name + '»' : 'Уже есть в «' + p.name + '»');
       renderList(); renderCounts();
